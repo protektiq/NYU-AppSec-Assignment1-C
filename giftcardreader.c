@@ -10,7 +10,12 @@
 #include "giftcard.h"
 
 #include <stdio.h>
-#include <strings.h>
+#include <string.h>
+
+// fix: get_gift_card_value() was called (in print_gift_card_info() and
+// gift_card_json(), below) before it was defined, and there was no
+// prototype anywhere, so the compiler had to guess its signature.
+int get_gift_card_value(struct this_gift_card *thisone);
 
 // interpreter for THX-1138 assembly
 void animate(char *msg, unsigned char *program) {
@@ -19,33 +24,51 @@ void animate(char *msg, unsigned char *program) {
     unsigned char *pc = program;
     int i = 0;
     int zf = 0;
+    int instructions_executed = 0;
     while (1) {
+        //hang: a crafted program's relative jump (case 0x09 below) can
+        //leave pc net-unchanged each time through this loop (e.g. a jump
+        //of -3 right after itself), spinning forever without ever
+        //tripping the one-sided "pc > program+256" check further down.
+        //Cap the number of instructions executed so no program can hang.
+        if (instructions_executed++ > 100000) break;
         unsigned char op, arg1, arg2;
         op = *pc;
         arg1 = *(pc+1);
         arg2 = *(pc+2);
+        // fix: arg1/arg2 are raw program bytes (0-255) used directly as
+        // indices into regs[16] below with no bounds check; mask them
+        // into range instead of indexing out of the array.
+        unsigned char reg1 = arg1 & 0x0F;
+        unsigned char reg2 = arg2 & 0x0F;
         switch (*pc) {
             case 0x00:
                 break;
             case 0x01:
-                regs[arg1] = *mptr;
+                regs[reg1] = *mptr;
                 break;
             case 0x02:
-                *mptr = regs[arg1];
+                *mptr = regs[reg1];
                 break;
+            //crash2: mptr could be moved by an arbitrary signed amount
+            //with no bounds check, and a later write through it (case
+            //0x02 above) would fault once mptr had walked off of the
+            //32-byte message buffer entirely. Only move the cursor if
+            //the destination stays inside the message buffer.
             case 0x03:
-                mptr += (char)arg1;
+                if (mptr + (char)arg1 >= msg && mptr + (char)arg1 < msg + 32)
+                    mptr += (char)arg1;
                 break;
             case 0x04:
-                regs[arg2] = arg1;
+                regs[reg2] = arg1;
                 break;
             case 0x05:
-                regs[arg1] ^= regs[arg2];
-                zf = !regs[arg1];
+                regs[reg1] ^= regs[reg2];
+                zf = !regs[reg1];
                 break;
             case 0x06:
-                regs[arg1] += regs[arg2];
-                zf = !regs[arg1];
+                regs[reg1] += regs[reg2];
+                zf = !regs[reg1];
                 break;
             case 0x07:
                 puts(msg);
@@ -71,6 +94,14 @@ void print_gift_card_info(struct this_gift_card *thisone) {
 	struct gift_card_record_data *gcrd_ptr;
 	struct gift_card_amount_change *gcac_ptr;
     struct gift_card_program *gcp_ptr;
+
+	//crash1 (continued): gift_card_reader() bails out early on a bad
+	//file and leaves gift_card_data NULL; without this check we'd
+	//dereference that NULL pointer here instead.
+	if (thisone == NULL || thisone->gift_card_data == NULL) {
+		printf("  (unreadable or invalid gift card file)\n\n");
+		return;
+	}
 
 	gcd_ptr = thisone->gift_card_data;
 	printf("   Merchant ID: %32.32s\n",gcd_ptr->merchant_id);
@@ -106,6 +137,11 @@ void gift_card_json(struct this_gift_card *thisone) {
     struct gift_card_data *gcd_ptr;
     struct gift_card_record_data *gcrd_ptr;
     struct gift_card_amount_change *gcac_ptr;
+    //crash1 (continued): same NULL guard as print_gift_card_info() above.
+    if (thisone == NULL || thisone->gift_card_data == NULL) {
+        printf("{\n  \"error\": \"unreadable or invalid gift card file\"\n}\n");
+        return;
+    }
     gcd_ptr = thisone->gift_card_data;
     printf("{\n");
     printf("  \"merchant_id\": \"%32.32s\",\n", gcd_ptr->merchant_id);
@@ -174,6 +210,10 @@ int get_gift_card_value(struct this_gift_card *thisone) {
 struct this_gift_card *gift_card_reader(FILE *input_fd) {
 
 	struct this_gift_card *ret_val = malloc(sizeof(struct this_gift_card));
+	// fix: leave gift_card_data in a known (NULL) state so callers can
+	// tell a bad/truncated file (an early break below) apart from a
+	// successfully parsed one, instead of dereferencing garbage.
+	ret_val->gift_card_data = NULL;
 
     void *optr;
 	void *ptr;
@@ -183,10 +223,17 @@ struct this_gift_card *gift_card_reader(FILE *input_fd) {
 
 		struct gift_card_data *gcd_ptr;
 		/* JAC: Why aren't return types checked? */
-		fread(&ret_val->num_bytes, 4,1, input_fd);
+		if (fread(&ret_val->num_bytes, 4,1, input_fd) != 1) break;
+
+		//crash1: num_bytes came straight from the file with no
+		//validation; a negative (or absurdly large) value made the
+		//malloc() below fail and the next fread() then wrote through
+		//the resulting NULL pointer. Reject bad sizes before using them.
+		if (ret_val->num_bytes <= 0 || ret_val->num_bytes > 100*1024*1024) break;
 
 		// Make something the size of the rest and read it in
 		ptr = malloc(ret_val->num_bytes);
+		if (ptr == NULL) break;
 		fread(ptr, ret_val->num_bytes, 1, input_fd);
 
         optr = ptr-4;
@@ -198,18 +245,26 @@ struct this_gift_card *gift_card_reader(FILE *input_fd) {
 		gcd_ptr->customer_id = ptr;
 		ptr += 32;	
 		/* JAC: Something seems off here... */
-		gcd_ptr->number_of_gift_card_records = *((char *)ptr);
+		// fix: this read only 1 byte (as a signed char, so values
+		// 0x80-0xFF became negative) into a 4-byte field; read the
+		// full int the writer actually put there, and sanity-check it.
+		gcd_ptr->number_of_gift_card_records = *((int *)ptr);
 		ptr += 4;
+		if (gcd_ptr->number_of_gift_card_records < 0 ||
+		    gcd_ptr->number_of_gift_card_records > 100000) break;
 
 		gcd_ptr->gift_card_record_data = (void *)malloc(gcd_ptr->number_of_gift_card_records*sizeof(void*));
 
+		// fix: off-by-one -- this used to be i<=..., which wrote one
+		// record pointer past the end of the array just allocated above.
 		// Now ptr points at the gift card recrod data
-		for (int i=0; i<=gcd_ptr->number_of_gift_card_records; i++){
+		for (int i=0; i<gcd_ptr->number_of_gift_card_records; i++){
 			//printf("i: %d\n",i);
 			struct gift_card_record_data *gcrd_ptr;
 			gcrd_ptr = gcd_ptr->gift_card_record_data[i] = malloc(sizeof(struct gift_card_record_data));
 			struct gift_card_amount_change *gcac_ptr;
-			gcac_ptr = gcrd_ptr->actual_record = malloc(sizeof(struct gift_card_record_data));
+			// fix: was allocated with the wrong struct's size
+			gcac_ptr = gcrd_ptr->actual_record = malloc(sizeof(struct gift_card_amount_change));
             struct gift_card_program *gcp_ptr;
 			gcp_ptr = malloc(sizeof(struct gift_card_program));
 
@@ -227,11 +282,14 @@ struct this_gift_card *gift_card_reader(FILE *input_fd) {
 				ptr += 4;	
 
 				// don't need a sig if negative
-				/* JAC: something seems off here */
-				if (gcac_ptr < 0) break;
-
-				gcac_ptr->actual_signature = ptr;
-				ptr+=32;
+				// fix: this compared the pointer itself to 0 (always
+				// false, so the signature was always read) instead of
+				// amount_added, and `break` wrongly aborted all
+				// remaining records instead of skipping just this one.
+				if (gcac_ptr->amount_added >= 0) {
+					gcac_ptr->actual_signature = ptr;
+					ptr+=32;
+				}
 			}
 			// message
 			if (gcrd_ptr->type_of_record == 2) {
@@ -261,7 +319,16 @@ struct this_gift_card *thisone;
 
 int main(int argc, char **argv) {
     // BDG: no argument checking?
+    // fix: argv[1]/argv[2] were read with no check that they existed.
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <1|2> <file.gft>\n", argv[0]);
+        return 1;
+    }
 	FILE *input_fd = fopen(argv[2],"r");
+	if (input_fd == NULL) {
+		fprintf(stderr, "could not open file: %s\n", argv[2]);
+		return 1;
+	}
 	thisone = gift_card_reader(input_fd);
 	if (argv[1][0] == '1') print_gift_card_info(thisone);
     else if (argv[1][0] == '2') gift_card_json(thisone);
